@@ -1,7 +1,8 @@
 /*
  * haze.c — Haze: Hybrid Attention Entropy System
  * PostGPT: post-transformer hybrid attention language model
- *
+ * Janus Architecture  
+ * 
  * Three attention modes:
  *   RRPRAM  — attn = x @ wr          (positional pattern recognition)
  *   Content — attn = (x@wq)(x@wk)^T  (semantic similarity, classic QKV)
