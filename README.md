@@ -1,4 +1,6 @@
 # RRPRAM — Recursive Resonant Pattern Recognition Attention Mechanism
+## Janus Architecture  
+
 - by Arianna Method  
 
 ## The Core Insight
