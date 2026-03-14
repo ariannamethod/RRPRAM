@@ -1,5 +1,6 @@
 /*
  * rrpram.c — RRPRAM Transformer
+ * Janus Architecture  
  * Recursive Resonant Pattern Recognition Attention Mechanism
  *
  * Standard attention: attn[i,j] = (x@wq)_i · (x@wk)_j  (bilinear, semantic)
