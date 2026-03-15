@@ -1,6 +1,5 @@
 /*
  * resonance.c — Field Resonance Architecture
- * Janus Architecture.  
  *
  * θ = ε + γ + αδ
  *   ε = trained weights (~1M, small but alive)
@@ -46,7 +45,7 @@ typedef struct {
 static Cfg cfg_from_depth(int depth) {
     Cfg c;
     c.T = (depth >= 8) ? 64 : 32;
-    c.E = depth * 16;
+    c.E = depth * 32;
     c.H = (depth < 4) ? 2 : 4;
     c.D = c.E / c.H;
     c.B = depth;
@@ -332,7 +331,9 @@ static void df_overlay(float *logits, int V) {
 
     /* H: Hebbian resonance from co-occurrence */
     float h_max = 0;
-    float *H_sig = calloc(V, sizeof(float));
+    static float H_sig_buf[VOCAB];
+    float *H_sig = H_sig_buf;
+    memset(H_sig, 0, V * sizeof(float));
     int ctx_start = (DF.ctx_len > 8) ? DF.ctx_len - 8 : 0;
     for (int c = ctx_start; c < DF.ctx_len; c++) {
         float decay = powf(0.9f, (float)(DF.ctx_len - 1 - c));
@@ -345,7 +346,9 @@ static void df_overlay(float *logits, int V) {
 
     /* F: Prophecy fulfillment */
     float f_max = 0;
-    float *F_sig = calloc(V, sizeof(float));
+    static float F_sig_buf[VOCAB];
+    float *F_sig = F_sig_buf;
+    memset(F_sig, 0, V * sizeof(float));
     for (int i = 0; i < V; i++) {
         float *te = df_embed(i);
         if (!te) continue;
@@ -365,7 +368,9 @@ static void df_overlay(float *logits, int V) {
     if (f_max > 1e-6f) for (int i = 0; i < V; i++) F_sig[i] /= f_max;
 
     /* A: Destiny attraction */
-    float *A_sig = calloc(V, sizeof(float));
+    static float A_sig_buf[VOCAB];
+    float *A_sig = A_sig_buf;
+    memset(A_sig, 0, V * sizeof(float));
     if (DF.dest_mag > 1e-6f) {
         float a_max = 0;
         for (int i = 0; i < V; i++) {
@@ -398,7 +403,7 @@ static void df_overlay(float *logits, int V) {
     DF.entropy = df_clamp(DF.dissonance * 0.4f + (1.0f - DF.resonance) * 0.3f + 0.2f, 0.1f, 1.0f);
     DF.emergence = df_clamp((1.0f - DF.entropy) * DF.resonance, 0, 1);
 
-    free(H_sig); free(F_sig); free(A_sig);
+    /* static buffers — no free needed */
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -476,7 +481,16 @@ typedef struct {
 } Model;
 
 static void model_init(Model *m, int depth) {
+    if (depth < 1 || depth > MAX_BLK || depth * 32 > MAX_DIM) {
+        fprintf(stderr, "[resonance] error: depth=%d out of range\n", depth);
+        exit(EXIT_FAILURE);
+    }
     m->cfg = cfg_from_depth(depth);
+    Cfg *c = &m->cfg;
+    if (c->T > MAX_CTX || c->E > MAX_DIM || c->H < 1 || c->E % c->H != 0) {
+        fprintf(stderr, "[resonance] error: invalid config for depth=%d\n", depth);
+        exit(EXIT_FAILURE);
+    }
     m->n_params = model_size(&m->cfg);
     m->data  = calloc(m->n_params, sizeof(float));
     m->grad  = calloc(m->n_params, sizeof(float));
@@ -484,8 +498,6 @@ static void model_init(Model *m, int depth) {
     m->adam_v = calloc(m->n_params, sizeof(float));
     assign_ptrs(&m->w, m->data, &m->cfg);
     assign_ptrs(&m->g, m->grad, &m->cfg);
-
-    Cfg *c = &m->cfg;
     float scale = sqrtf(2.0f / VOCAB);
     for (int i = 0; i < VOCAB * c->E; i++) m->w.tok_emb[i] = randn() * scale;
     scale = sqrtf(2.0f / c->T);
@@ -622,6 +634,7 @@ static float forward(Model *m, Acts *a, const int *tokens, const int *targets) {
             matmul(ar, rm1, wr, T, E, T);
 
             /* RRPRAM path */
+            for (int i = 0; i < T*T; i++) ar[i] *= sc;
             causal_softmax(ar, T);
             float *out_r = calloc(T*D, sizeof(float));
             matmul(out_r, ar, v_h, T, T, D);
@@ -825,6 +838,7 @@ static void backward(Model *m, Acts *a, const int *tokens, const int *targets) {
                     d_raw[i*T+j] = ar[i*T+j] * (d_pat[i*T+j] - dot);
                 for (int j = i+1; j < T; j++) d_raw[i*T+j] = 0;
             }
+            for (int i = 0; i < T*T; i++) d_raw[i] *= sc;
             matmul_atb(g_wr, rm1, d_raw, E, T, T);
             float *dl_wr = calloc(T*E, sizeof(float));
             matmul_abt(dl_wr, d_raw, wr, T, T, E);
@@ -928,6 +942,12 @@ static void train(Model *m, Data *data, int steps, float lr) {
     int *tok = malloc(T * sizeof(int));
     int *tgt = malloc(T * sizeof(int));
 
+    if (data->len <= T + 1) {
+        fprintf(stderr, "[resonance] error: data too short (%d bytes, need > %d)\n",
+                data->len, T + 1);
+        exit(EXIT_FAILURE);
+    }
+
     printf("[resonance] training: %d steps, lr=%.1e\n", steps, lr);
     clock_t t0 = clock();
 
@@ -976,15 +996,20 @@ static void generate(Model *m, const char *seed, int n, float temp) {
     for (int i = 0; i < n; i++) {
         forward(m, &a, ctx, NULL);
         float *logits = a.logits + (T-1) * VOCAB;
-        if (temp != 1.0f)
-            for (int v = 0; v < VOCAB; v++) logits[v] /= temp;
-        row_softmax(logits, VOCAB);
-
-        float r = (float)rand() / RAND_MAX, cum = 0;
         int next = 0;
-        for (int v = 0; v < VOCAB; v++) {
-            cum += logits[v];
-            if (cum >= r) { next = v; break; }
+        if (temp <= 0.0f) {
+            float best = logits[0];
+            for (int v = 1; v < VOCAB; v++)
+                if (logits[v] > best) { best = logits[v]; next = v; }
+        } else {
+            if (temp != 1.0f)
+                for (int v = 0; v < VOCAB; v++) logits[v] /= temp;
+            row_softmax(logits, VOCAB);
+            float r = (float)rand() / RAND_MAX, cum = 0;
+            for (int v = 0; v < VOCAB; v++) {
+                cum += logits[v];
+                if (cum >= r) { next = v; break; }
+            }
         }
 
         putchar(next);
@@ -1014,13 +1039,27 @@ static void model_save(Model *m, const char *path) {
 static void model_load(Model *m, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
-    Cfg loaded; fread(&loaded, sizeof(Cfg), 1, f);
+    Cfg loaded;
+    if (fread(&loaded, sizeof(Cfg), 1, f) != 1) {
+        fprintf(stderr, "[resonance] failed to read config from %s\n", path);
+        fclose(f); exit(1);
+    }
+    if (loaded.B < 1 || loaded.B > MAX_BLK ||
+        loaded.T < 1 || loaded.T > MAX_CTX ||
+        loaded.E < 1 || loaded.E > MAX_DIM ||
+        loaded.H < 1 || loaded.E % loaded.H != 0) {
+        fprintf(stderr, "[resonance] corrupt config in %s\n", path);
+        fclose(f); exit(1);
+    }
     model_init(m, loaded.B);
     m->cfg = loaded;
     m->n_params = model_size(&m->cfg);
     assign_ptrs(&m->w, m->data, &m->cfg);
     assign_ptrs(&m->g, m->grad, &m->cfg);
-    fread(m->data, sizeof(float), m->n_params, f);
+    if (fread(m->data, sizeof(float), m->n_params, f) != (size_t)m->n_params) {
+        fprintf(stderr, "[resonance] truncated checkpoint %s\n", path);
+        fclose(f); exit(1);
+    }
     /* load Dario field state */
     if (fread(&DF, sizeof(DarioField), 1, f) != 1)
         printf("[resonance] warning: no field state in checkpoint\n");

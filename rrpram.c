@@ -1,6 +1,5 @@
 /*
  * rrpram.c — RRPRAM Transformer
- * Janus Architecture  
  * Recursive Resonant Pattern Recognition Attention Mechanism
  *
  * Standard attention: attn[i,j] = (x@wq)_i · (x@wk)_j  (bilinear, semantic)
@@ -42,7 +41,7 @@ typedef struct {
 static Cfg cfg_from_depth(int depth) {
     Cfg c;
     c.T = (depth >= 8) ? 64 : 32;
-    c.E = depth * 16;
+    c.E = depth * 32;
     c.H = (depth < 4) ? 2 : 4;
     c.D = c.E / c.H;
     c.B = depth;
@@ -221,7 +220,16 @@ static void assign_ptrs(Ptrs *p, float *base, Cfg *c) {
 }
 
 static void model_init(Model *m, int depth) {
+    if (depth < 1 || depth > MAX_BLK) {
+        fprintf(stderr, "[rrpram] error: depth=%d out of range (1..%d)\n", depth, MAX_BLK);
+        exit(EXIT_FAILURE);
+    }
     m->cfg = cfg_from_depth(depth);
+    Cfg *c = &m->cfg;
+    if (c->T > MAX_CTX || c->E > MAX_DIM || c->H < 1 || c->E % c->H != 0) {
+        fprintf(stderr, "[rrpram] error: invalid config for depth=%d\n", depth);
+        exit(EXIT_FAILURE);
+    }
     m->n_params = model_size(&m->cfg);
     m->data   = calloc(m->n_params, sizeof(float));
     m->grad   = calloc(m->n_params, sizeof(float));
@@ -229,8 +237,6 @@ static void model_init(Model *m, int depth) {
     m->adam_v  = calloc(m->n_params, sizeof(float));
     assign_ptrs(&m->w, m->data, &m->cfg);
     assign_ptrs(&m->g, m->grad, &m->cfg);
-
-    Cfg *c = &m->cfg;
     /* Xavier init for projections */
     float scale;
     scale = sqrtf(2.0f / VOCAB);
@@ -300,6 +306,7 @@ static float forward(Model *m, Acts *a, const int *tokens, const int *targets) {
     int T = c->T, E = c->E, H = c->H, D = c->D, B = c->B, M = c->M;
     Ptrs *w = &m->w;
     float *head_buf = (float *)calloc(T * D, sizeof(float));
+    float scale = 1.0f / sqrtf((float)D);
 
     /* embedding */
     float *x0 = a->x;  /* first block input */
@@ -333,6 +340,7 @@ static float forward(Model *m, Acts *a, const int *tokens, const int *targets) {
 
             /* raw = ln1 @ wr_h  [T,T]  ← THE RRPRAM INNOVATION */
             matmul(at_h, ln1, wr_h, T, E, T);
+            for (int i = 0; i < T*T; i++) at_h[i] *= scale;
 
             /* causal mask + softmax */
             for (int i = 0; i < T; i++) {
@@ -402,6 +410,7 @@ static void backward(Model *m, Acts *a, const int *tokens, const int *targets) {
     Cfg *c = &m->cfg;
     int T = c->T, E = c->E, H = c->H, D = c->D, B = c->B, M = c->M;
     Ptrs *w = &m->w, *g = &m->g;
+    float scale = 1.0f / sqrtf((float)D);
 
     memset(m->grad, 0, m->n_params * sizeof(float));
 
@@ -530,24 +539,11 @@ static void backward(Model *m, Acts *a, const int *tokens, const int *targets) {
                     d_raw[i*T+j] = 0;
             }
 
+            /* scale backward */
+            for (int i = 0; i < T*T; i++) d_raw[i] *= scale;
+
             /* RRPRAM backward: raw = ln1 @ wr */
-            /* d_wr += ln1^T @ d_raw  [E,T] */
-            matmul_atb(g_wr, ln1, d_raw, E, T, T);
-            /* Wait — need to ACCUMULATE, not overwrite */
-            /* Redo: compute into scratch and add */
-            {
-                float *tmp = calloc(E * T, sizeof(float));
-                matmul_atb(tmp, ln1, d_raw, E, T, T);
-                for (int i = 0; i < E*T; i++) g_wr[i] += tmp[i];
-                /* Oops, matmul_atb already wrote to g_wr. Need to fix. */
-                /* Actually, assign_ptrs points g_wr into m->grad which was zeroed.
-                   First head writes, subsequent heads need to accumulate.
-                   Since we process heads sequentially and g_wr points to different
-                   per-head slices, this is fine — each head has its own g_wr. */
-                free(tmp);
-            }
-            /* Actually, each head h has its own g_wr slice, so overwrite is correct. */
-            /* Re-do the matmul_atb to write directly: */
+            /* d_wr = ln1^T @ d_raw  [E,T] — each head has its own g_wr slice */
             matmul_atb(g_wr, ln1, d_raw, E, T, T);
 
             /* d_ln1 from wr path = d_raw @ wr^T  [T,E] */
@@ -641,6 +637,12 @@ static void train(Model *m, Data *data, int max_steps, float lr) {
     int *tokens = malloc(T * sizeof(int));
     int *targets = malloc(T * sizeof(int));
 
+    if (data->len <= T + 1) {
+        fprintf(stderr, "[rrpram] error: data too short (%d bytes, need > %d)\n",
+                data->len, T + 1);
+        exit(EXIT_FAILURE);
+    }
+
     printf("[rrpram] training: %d steps, lr=%.1e\n", max_steps, lr);
     clock_t t0 = clock();
 
@@ -689,17 +691,20 @@ static void generate(Model *m, const char *seed, int n_chars, float temperature)
 
         /* sample from last position */
         float *logits = a.logits + (T-1) * VOCAB;
-        if (temperature != 1.0f)
-            for (int v = 0; v < VOCAB; v++) logits[v] /= temperature;
-        row_softmax(logits, VOCAB);
-
-        /* sample */
-        float r = (float)rand() / RAND_MAX;
-        float cum = 0;
         int next = 0;
-        for (int v = 0; v < VOCAB; v++) {
-            cum += logits[v];
-            if (cum >= r) { next = v; break; }
+        if (temperature <= 0.0f) {
+            float best = logits[0];
+            for (int v = 1; v < VOCAB; v++)
+                if (logits[v] > best) { best = logits[v]; next = v; }
+        } else {
+            if (temperature != 1.0f)
+                for (int v = 0; v < VOCAB; v++) logits[v] /= temperature;
+            row_softmax(logits, VOCAB);
+            float r = (float)rand() / RAND_MAX, cum = 0;
+            for (int v = 0; v < VOCAB; v++) {
+                cum += logits[v];
+                if (cum >= r) { next = v; break; }
+            }
         }
 
         putchar(next);
@@ -729,18 +734,29 @@ static void model_load(Model *m, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
     Cfg loaded_cfg;
-    fread(&loaded_cfg, sizeof(Cfg), 1, f);
+    if (fread(&loaded_cfg, sizeof(Cfg), 1, f) != 1) {
+        fprintf(stderr, "[rrpram] failed to read config from %s\n", path);
+        fclose(f); exit(1);
+    }
+    if (loaded_cfg.B < 1 || loaded_cfg.B > MAX_BLK ||
+        loaded_cfg.T < 1 || loaded_cfg.T > MAX_CTX ||
+        loaded_cfg.E < 1 || loaded_cfg.E > MAX_DIM ||
+        loaded_cfg.H < 1 || loaded_cfg.E % loaded_cfg.H != 0) {
+        fprintf(stderr, "[rrpram] corrupt config in %s\n", path);
+        fclose(f); exit(1);
+    }
 
-    /* reinit with loaded config */
     int depth = loaded_cfg.B;
     model_init(m, depth);
-    /* overwrite cfg in case T differs */
     m->cfg = loaded_cfg;
     m->n_params = model_size(&m->cfg);
     assign_ptrs(&m->w, m->data, &m->cfg);
     assign_ptrs(&m->g, m->grad, &m->cfg);
 
-    fread(m->data, sizeof(float), m->n_params, f);
+    if (fread(m->data, sizeof(float), m->n_params, f) != (size_t)m->n_params) {
+        fprintf(stderr, "[rrpram] truncated checkpoint %s\n", path);
+        fclose(f); exit(1);
+    }
     fclose(f);
     printf("[rrpram] loaded %s\n", path);
 }

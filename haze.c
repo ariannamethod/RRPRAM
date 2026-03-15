@@ -1,8 +1,7 @@
 /*
  * haze.c — Haze: Hybrid Attention Entropy System
  * PostGPT: post-transformer hybrid attention language model
- * Janus Architecture  
- * 
+ *
  * Three attention modes:
  *   RRPRAM  — attn = x @ wr          (positional pattern recognition)
  *   Content — attn = (x@wq)(x@wk)^T  (semantic similarity, classic QKV)
@@ -50,7 +49,7 @@ typedef struct {
 static Cfg cfg_from_depth(int depth, HeadMode mode) {
     Cfg c;
     c.T = (depth >= 8) ? 64 : 32;
-    c.E = depth * 16;
+    c.E = depth * 32;
     c.H = (depth < 4) ? 2 : 4;
     c.D = c.E / c.H;
     c.B = depth;
@@ -191,6 +190,8 @@ static int sample_top_k(float *logits, int n, int k, float temp) {
         for (int i = 1; i < n; i++) if (logits[i] > logits[best]) best = i;
         return best;
     }
+    if (k <= 0) k = 1;
+    if (k > n)  k = n;
     /* find k-th largest value */
     float *sorted = malloc(n * sizeof(float));
     memcpy(sorted, logits, n * sizeof(float));
@@ -449,7 +450,16 @@ typedef struct {
 } Model;
 
 static void model_init(Model *m, int depth, HeadMode mode) {
+    if (depth < 1 || depth > MAX_BLK) {
+        fprintf(stderr, "[haze] error: depth=%d out of range (1..%d)\n", depth, MAX_BLK);
+        exit(EXIT_FAILURE);
+    }
     m->cfg = cfg_from_depth(depth, mode);
+    Cfg *c = &m->cfg;
+    if (c->T > MAX_CTX || c->E > MAX_DIM || c->H < 1 || c->E % c->H != 0) {
+        fprintf(stderr, "[haze] error: invalid config for depth=%d\n", depth);
+        exit(EXIT_FAILURE);
+    }
     m->n_params = model_size(&m->cfg);
     m->data   = calloc(m->n_params, sizeof(float));
     m->grad   = calloc(m->n_params, sizeof(float));
@@ -457,8 +467,6 @@ static void model_init(Model *m, int depth, HeadMode mode) {
     m->adam_v  = calloc(m->n_params, sizeof(float));
     assign_ptrs(&m->w, m->data, &m->cfg);
     assign_ptrs(&m->g, m->grad, &m->cfg);
-
-    Cfg *c = &m->cfg;
     float scale;
 
     /* Xavier init */
@@ -584,10 +592,11 @@ static float forward(Model *m, Acts *a, const int *tokens, const int *targets) {
             matmul(v_h, ln1, wv_h, T, E, D);
 
             if (c->mode == MODE_RRPRAM) {
-                /* RRPRAM: attn = ln1 @ wr */
+                /* RRPRAM: attn = ln1 @ wr / sqrt(D) */
                 float *wr_h = head_wr(w, c, b, h);
                 float *at_h = a->attn_r + (b*H+h) * T * T;
                 matmul(at_h, ln1, wr_h, T, E, T);
+                for (int i = 0; i < T*T; i++) at_h[i] *= scale;
                 causal_mask_softmax(at_h, T);
                 matmul(head_buf, at_h, v_h, T, T, D);
 
@@ -620,6 +629,7 @@ static float forward(Model *m, Acts *a, const int *tokens, const int *targets) {
 
                 /* RRPRAM path */
                 matmul(at_r, ln1, wr_h, T, E, T);
+                for (int i = 0; i < T*T; i++) at_r[i] *= scale;
                 causal_mask_softmax(at_r, T);
                 float *out_r = calloc(T * D, sizeof(float));
                 matmul(out_r, at_r, v_h, T, T, D);
@@ -797,6 +807,7 @@ static void backward(Model *m, Acts *a, const int *tokens, const int *targets) {
                         d_raw[i*T+j] = at_h[i*T+j] * (d_pat[i*T+j] - dot);
                     for (int j = i+1; j < T; j++) d_raw[i*T+j] = 0;
                 }
+                for (int i = 0; i < T*T; i++) d_raw[i] *= scale;
 
                 matmul_atb(g_wr, ln1, d_raw, E, T, T);
                 float *d_ln1_wr = calloc(T * E, sizeof(float));
@@ -908,6 +919,7 @@ static void backward(Model *m, Acts *a, const int *tokens, const int *targets) {
                         d_raw[i*T+j] = at_r[i*T+j] * (d_pat[i*T+j] - dot);
                     for (int j = i+1; j < T; j++) d_raw[i*T+j] = 0;
                 }
+                for (int i = 0; i < T*T; i++) d_raw[i] *= scale;
                 matmul_atb(g_wr, ln1, d_raw, E, T, T);
 
                 float *d_ln1_wr = calloc(T * E, sizeof(float));
@@ -1026,6 +1038,12 @@ static void train(Model *m, Data *data, int max_steps, float lr) {
     int *tokens = malloc(T * sizeof(int));
     int *targets = malloc(T * sizeof(int));
 
+    if (data->len <= T + 1) {
+        fprintf(stderr, "[haze] error: data too short (%d bytes, need > %d)\n",
+                data->len, T + 1);
+        exit(EXIT_FAILURE);
+    }
+
     const char *mode_str[] = {"rrpram", "content", "hybrid"};
     printf("[haze] training (%s): %d steps, lr=%.1e\n", mode_str[m->cfg.mode], max_steps, lr);
     clock_t t0 = clock();
@@ -1107,7 +1125,10 @@ static void generate(Model *m, const char *seed, int n_chars, Sampling samp,
         memmove(ctx, ctx+1, (T-1) * sizeof(int));
         ctx[T-1] = next;
     }
-    printf("\n\n[haze] avg entropy: %.2f bits\n", total_entropy / n_chars);
+    if (n_chars > 0)
+        printf("\n\n[haze] avg entropy: %.2f bits\n", total_entropy / n_chars);
+    else
+        printf("\n\n[haze] avg entropy: N/A\n");
 
     acts_free(&a);
     free(ctx);
@@ -1128,7 +1149,20 @@ static void model_load(Model *m, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
     Cfg loaded_cfg;
-    fread(&loaded_cfg, sizeof(Cfg), 1, f);
+    if (fread(&loaded_cfg, sizeof(Cfg), 1, f) != 1) {
+        fprintf(stderr, "[haze] failed to read config from %s\n", path);
+        fclose(f); exit(1);
+    }
+    if (loaded_cfg.B < 1 || loaded_cfg.B > MAX_BLK ||
+        loaded_cfg.T < 1 || loaded_cfg.T > MAX_CTX ||
+        loaded_cfg.E < 1 || loaded_cfg.E > MAX_DIM ||
+        loaded_cfg.H < 1 || loaded_cfg.E % loaded_cfg.H != 0 ||
+        (loaded_cfg.mode != MODE_RRPRAM &&
+         loaded_cfg.mode != MODE_CONTENT &&
+         loaded_cfg.mode != MODE_HYBRID)) {
+        fprintf(stderr, "[haze] corrupt config in %s\n", path);
+        fclose(f); exit(1);
+    }
 
     int depth = loaded_cfg.B;
     model_init(m, depth, loaded_cfg.mode);
@@ -1137,7 +1171,10 @@ static void model_load(Model *m, const char *path) {
     assign_ptrs(&m->w, m->data, &m->cfg);
     assign_ptrs(&m->g, m->grad, &m->cfg);
 
-    fread(m->data, sizeof(float), m->n_params, f);
+    if (fread(m->data, sizeof(float), m->n_params, f) != (size_t)m->n_params) {
+        fprintf(stderr, "[haze] truncated checkpoint %s\n", path);
+        fclose(f); exit(1);
+    }
     fclose(f);
     printf("[haze] loaded %s\n", path);
 }
