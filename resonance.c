@@ -1,8 +1,9 @@
 /*
- * resonance.c — Field Resonance Architecture
+ * resonance.c — Field Resonance 
+ * Arianna Method Janus Architecture
  *
  * θ = ε + γ + αδ
- *   ε = trained weights (~1M, small but alive)
+ *   ε = trained weights 
  *   γ = RRPRAM positional patterns + SwiGLU structure
  *   δ = Dario field (H+F+A+T, Kuramoto chambers, co-occurrence memory)
  *
